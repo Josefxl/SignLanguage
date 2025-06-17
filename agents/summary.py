@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class SummaryAgent:
-    def __init__(self, model_name="google/flan-t5-base"):
+    def __init__(self, model_name="google/flan-t5-xl"):
         logger.info(f"Loading summary model: {model_name}")
         try:
             tokenizer = AutoTokenizer.from_pretrained(model_name)
