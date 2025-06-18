@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class Captioner:
-    def __init__(self, model_name="google/flan-t5-large"):
+    def __init__(self, model_name="google/flan-t5-xl"):
         logger.info(f"Loading model {model_name}...")
         try:
             tokenizer = AutoTokenizer.from_pretrained(model_name)
