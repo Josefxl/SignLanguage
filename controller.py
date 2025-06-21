@@ -1,17 +1,12 @@
+import os
+import json
+import datetime
 from agents.captioner import Captioner
-from agents.tutor import AdaptiveTutorAgent as TutorAgent
+from agents.tutor import AdaptiveTutorAgent
 from agents.monitor import BehaviorMonitorAgent
-from agents.rl_agent import RLAgent
-from agents.rl_environment import TeachingEnvironment
-from agents.logger import SessionLogger
 from sentence_transformers import SentenceTransformer, util
+from agents.reinforce_memory import ReinforcementMemory
 from langchain.memory import ConversationBufferMemory
-from datetime import datetime
-import logging
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Semantic similarity model
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -21,137 +16,98 @@ def is_semantically_similar(expected: str, actual: str, threshold: float = 0.75)
     score = util.pytorch_cos_sim(embeddings[0], embeddings[1]).item()
     return score >= threshold, score
 
-
 class ControllerAgent:
     def __init__(self):
         self.captioner = Captioner()
-        self.tutor = TutorAgent()
+        self.tutor = AdaptiveTutorAgent()
         self.monitor = BehaviorMonitorAgent()
-        self.env = TeachingEnvironment()
-        self.rl_agent = RLAgent(environment=self.env)
-        self.logger = SessionLogger()
         self.memory = ConversationBufferMemory(memory_key="history", return_messages=True)
 
-    def run_lesson(self, prompts=None):
-        if prompts is None:
-            prompts = self.tutor.get_prompt_batch()
+        # Always clear LLM memory to prevent semantic repetition
+        self.memory.clear()
+        print("🧠 Chat memory cleared.")
 
-        correct = 0
-        skipped = 0
-        session_log = []
+        # Ask about reinforcement memory only
+        clear_reinforcement = input("🧪 Also clear reinforcement memory (weak/strong prompts)? (y/n): ").lower()
+        if clear_reinforcement == "y":
+            self.tutor.memory.clear_memory()
+            print("🧽 Reinforcement memory cleared.\n")
+
+    def run_lesson(self):
+        batch = self.tutor.get_prompt_batch()
+        results = []
 
         print("\n📘 Starting full sign language lesson...\n")
 
-        for expected in prompts:
-            print(f"Tutor says: Please sign – '{expected}'")
-            gloss = input("✋ Please enter your gloss: ").strip()
-
-            if not gloss:
-                skipped += 1
-                print("⏳ Skipped – no sign detected.\n")
-                self.memory.chat_memory.add_user_message("(no gloss)")
-                self.memory.chat_memory.add_ai_message("(skipped)")
-                session_log.append({
-                    "prompt": expected,
-                    "gloss": "(none)",
-                    "caption": "(skipped)",
-                    "similarity": 0.0,
-                    "result": "Skipped"
-                })
-                continue
+        for prompt in batch:
+            print(f"Tutor says: Please sign – '{prompt}'")
+            gloss = input("✋ Please enter your gloss: ")
 
             caption = self.captioner.caption(gloss)
             print(f"📝 Captioner translated: {caption}")
-            self.memory.chat_memory.add_user_message(gloss)
-            self.memory.chat_memory.add_ai_message(caption)
 
-            similar, score = is_semantically_similar(expected, caption)
+            similar, similarity_score = is_semantically_similar(prompt, caption)
+            correct = similar
 
-            if similar:
-                correct += 1
-                print(f"✅ Great job! (Similarity: {score:.2f})\n")
-                session_log.append({
-                    "prompt": expected,
-                    "gloss": gloss,
-                    "caption": caption,
-                    "similarity": score,
-                    "result": "Correct"
-                })
-            else:
-                print(f"❌ Incorrect. Expected: '{expected}' (Similarity: {score:.2f})")
-                retry = input("❓ Would you like to try that again? (y/n): ").strip().lower()
+            results.append({
+                "prompt": prompt,
+                "gloss": gloss,
+                "caption": caption,
+                "similarity": round(similarity_score, 2),
+                "result": "Correct" if correct else "Incorrect"
+            })
 
-                if retry == "y":
-                    gloss = input("✋ Try again – enter your gloss: ").strip()
-                    caption = self.captioner.caption(gloss)
-                    print(f"📝 Captioner translated: {caption}")
-                    self.memory.chat_memory.add_user_message(gloss)
-                    self.memory.chat_memory.add_ai_message(caption)
-                    similar, score = is_semantically_similar(expected, caption)
-                    if similar:
-                        correct += 1
-                        print(f"✅ Great job! (Similarity: {score:.2f})\n")
-                        session_log.append({
-                            "prompt": expected,
-                            "gloss": gloss,
-                            "caption": caption,
-                            "similarity": score,
-                            "result": "Correct (Retry)"
-                        })
-                        continue
-                    else:
-                        print("❌ Still incorrect. Let's move on.\n")
+        correct_count = sum(1 for r in results if r["result"] == "Correct")
+        skipped_count = sum(1 for r in results if r["gloss"].strip() == "")
+        total = len(results)
+        score = round(100 * correct_count / total, 1) if total else 0
+        incorrect_count = total - correct_count - skipped_count  # ✅ Added this
 
-                session_log.append({
-                    "prompt": expected,
-                    "gloss": gloss,
-                    "caption": caption,
-                    "similarity": score,
-                    "result": "Incorrect"
-                })
+        # Save feedback
+        self.tutor.memory.update(results)
+        self.tutor.update_performance(correct_count, total)
 
-        total = len(prompts)
-        score_percent = (correct / total) * 100 if total else 0.0
+        difficulty = self.tutor.performance_level
+        state, behavior_action = self.monitor.analyze_behavior(correct_count, incorrect_count, skipped_count)  # ✅ Fixed variable use
 
-        # 🎓 Summary
+        print(f"📊 Behavior State: {state}")
+        print(f"{behavior_action}")  # ✅ Correct reference
+
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        os.makedirs("logs", exist_ok=True)
+        log_path = f"logs/session_{timestamp}.json"
+
+        with open(log_path, "w") as f:
+            json.dump({
+                "results": results,
+                "score": score,
+                "difficulty": difficulty,
+                "state": state,
+                "behavior_action": behavior_action
+            }, f, indent=2)
+
         print("\n🎓 Lesson Summary:")
-        print(f"Correct: {correct}")
-        print(f"Skipped: {skipped}")
+        print(f"Correct: {correct_count}")
+        print(f"Skipped: {skipped_count}")
         print(f"Total: {total}")
-        print(f"Score: {score_percent:.1f}%")
+        print(f"Score: {score}%")
 
-        # 🧠 RL Agent adapts difficulty
-        new_level = self.rl_agent.act_and_learn(correct, total)
-        self.tutor.performance_level = new_level
-        print(f"\n🧠 RL Agent selected new difficulty level: {new_level}")
+        print(f"\n🧠 RL Agent selected new difficulty level: {difficulty}")
+        print(f"🧠 Based on score: {correct_count}/{total}\n")
 
-        # 📘 Prompt Feedback
-        print("\n📘 Prompt-by-Prompt Feedback:")
-        for entry in session_log:
-            print(f"- Prompt: {entry['prompt']}")
-            print(f"  Gloss: {entry['gloss']}")
-            print(f"  Caption: {entry['caption']}")
-            print(f"  Similarity: {entry['similarity']:.2f}")
-            print(f"  Result: {entry['result']}\n")
+        print("📘 Prompt-by-Prompt Feedback:")
+        for r in results:
+            print(f"- Prompt: {r['prompt']}")
+            print(f"  Gloss: {r['gloss']}")
+            print(f"  Caption: {r['caption']}")
+            print(f"  Similarity: {r['similarity']}")
+            print(f"  Result: {r['result']}\n")
 
-        # 📊 Behavior Feedback
-        state, advice = self.monitor.analyze_behavior(
-            correct, total - correct - skipped, skipped
-        )
-        print("\n📊 Behavior Monitor Feedback:")
-        print(f"State: {state}")
-        print(f"Advice: {advice}")
+        print(f"📊 Behavior Monitor Action:\n{behavior_action}")
+        print(f"\n💾 Session log saved to: {log_path}")
 
-        # 💾 Save session log
-        self.logger.log_session(prompts, session_log, score_percent)
-
-        # 🧠 Update memory
-        self.tutor.memory.update(session_log)
-
-        # 🔁 Ask if user wants to continue
-        user_choice = input("\n🔁 Would you like to continue with a new set of prompts? (y/n): ").strip().lower()
-        if user_choice == "y":
-            new_prompts = self.tutor.get_prompt_batch()
-            self.run_lesson(prompts=new_prompts)
+        cont = input("\n🔁 Would you like to continue with a new set of prompts? (y/n): ")
+        if cont.lower() == "y":
+            self.run_lesson()
         else:
-            print("\n👋 Ending session. Great job!\n")
+            print("\n👋 Ending session. Great job!")
